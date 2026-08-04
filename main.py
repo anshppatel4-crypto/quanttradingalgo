@@ -1,22 +1,12 @@
 """main.py
 Updated entry point: scan the S&P 500 (or tickers.txt) and evaluate all option contracts priced under $1000.
 
-Changes made:
-- If tickers.txt exists, use it. Otherwise fetch S&P 500 list from Wikipedia.
-- Removed the strict ATM + DTE (35-55) restriction: evaluate all expirations and all strikes.
-- For each option, compute an option "price" using mid=(bid+ask)/2 when available, or lastPrice as a fallback.
-  Only keep contracts with price < 1000.
-- Use a bounded ThreadPoolExecutor to scan tickers in parallel (small concurrency) and a short sleep
-  between tickers to avoid hammering yfinance.
-- Still uses the GARCHEngine to forecast next-day annual volatility and computes the edge vs market IV.
-
-Usage:
-  python main.py
-
-Notes:
-- Scanning the full S&P 500 can be slow and may hit rate limits; start with a small subset for testing
-  by creating a tickers.txt file with one ticker per line.
-- The script still relies on yfinance and arch; see requirements.txt for dependencies.
+Improvements in this update:
+- Robust tickers.txt parsing & normalization to handle literal "\\n" / "\\N" escapes, commas, semicolons,
+  and some concatenated uppercase sequences (e.g. AAPLMSFTAMZN will be split into AAPL, MSFT, AMZN when possible).
+- Validation of ticker tokens (keeps A-Z, 0-9, dot, dash) and normalizes '.' -> '-' for Yahoo format.
+- Writes results.csv with candidate rows (columns: ticker, option_type, strike, expiration, opt_price, market_iv, pred_vol, edge).
+- Keeps previous behavior (S&P fetch fallback, concurrency, option price cap, GARCH engine).
 """
 
 from scanner_engine.data_fetcher import fetch_historical_prices, fetch_options_chain
@@ -27,6 +17,7 @@ import concurrent.futures
 import time
 import pandas as pd
 import sys
+import re
 
 # Configuration
 EDGE_THRESHOLD = 0.04  # 4% in decimal
@@ -35,6 +26,7 @@ SLEEP_BETWEEN_TICKERS = 0.2  # seconds
 OPTION_PRICE_CAP = 1000.0  # only consider options priced below this
 MIN_PRICE = 0.0001
 MIN_HISTORY_DAYS = 100
+RESULTS_CSV = "results.csv"
 
 
 def format_pct(x):
@@ -76,23 +68,59 @@ def print_report(recs):
 
 
 def load_watchlist(path="tickers.txt"):
-    # If user provided tickers.txt, use it (one ticker per line).
+    """Load tickers from file if present, otherwise fetch S&P 500 list from Wikipedia.
+
+    This function is defensive: it will normalize common mistakes such as literal
+    "\\n" characters, use commas/semicolons as separators, and attempt to split
+    concatenated uppercase sequences into plausible tickers.
+    """
+    # If user provided tickers.txt, try to parse & normalize it
     try:
-        with open(path, "r") as f:
-            tickers = [line.strip().upper() for line in f if line.strip()]
-            if tickers:
-                print(f"Loaded {len(tickers)} tickers from {path}.")
-                return tickers
+        raw = open(path, 'r', encoding='utf8').read()
+        if raw and raw.strip():
+            # Replace common escaped newline sequences with an actual newline
+            cleaned = raw.replace('\\n', '\n').replace('\\N', '\n').replace('\\r\\n', '\n')
+            # Replace commas/semicolons with newlines
+            cleaned = re.sub(r'[;,]+', '\n', cleaned)
+            # Extract tokens consisting of letters/digits/dot/dash
+            tokens = re.findall(r'[A-Za-z0-9\.\-]+', cleaned)
+
+            symbols = []
+            for t in tokens:
+                t = t.strip()
+                if not t:
+                    continue
+                # If token looks artificially long (no separators), attempt to split
+                if len(t) > 8:
+                    # Find sequences of 1-5 uppercase letters/digits possibly with - (e.g. BRK-B)
+                    parts = re.findall(r'[A-Z]{1,5}(?:-[A-Z0-9]{1,5})?', t.upper())
+                    if parts:
+                        symbols.extend(parts)
+                        continue
+                symbols.append(t.upper())
+
+            # Normalize '.' -> '-' for Yahoo tickers and filter valid shapes
+            normalized = []
+            for s in symbols:
+                s2 = s.replace('.', '-').upper()
+                # Keep only tokens that look like tickers (letters/digits/dot/dash), length 1-8
+                if re.fullmatch(r'[A-Z0-9\-\.]{1,8}', s2):
+                    normalized.append(s2)
+
+            if normalized:
+                print(f"Loaded {len(normalized)} tickers from {path} (normalized).")
+                return normalized
     except FileNotFoundError:
         pass
+    except Exception as e:
+        print(f"Warning: failed to parse {path}: {e}")
 
-    # Otherwise fetch S&P 500 symbols from Wikipedia
+    # Fallback: fetch S&P 500 symbols from Wikipedia
     print("Fetching S&P 500 tickers from Wikipedia...")
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = tables[0]
         symbols = df['Symbol'].tolist()
-        # Yahoo uses '-' instead of '.' for certain tickers (e.g. BRK.B -> BRK-B)
         symbols = [s.replace('.', '-').upper() for s in symbols]
         print(f"Loaded {len(symbols)} S&P 500 tickers.")
         return symbols
@@ -120,14 +148,14 @@ def option_mid_price(row):
     except Exception:
         last = None
 
-    if bid and ask and ask > 0 and bid >= 0:
+    if bid is not None and ask is not None and ask > 0 and bid >= 0:
         mid = (bid + ask) / 2.0
         return mid
-    if last and last > 0:
+    if last is not None and last > 0:
         return last
-    if ask and ask > 0:
+    if ask is not None and ask > 0:
         return ask
-    if bid and bid > 0:
+    if bid is not None and bid > 0:
         return bid
     return None
 
@@ -230,6 +258,20 @@ def main():
     # Sort by edge desc
     all_recs = sorted(all_recs, key=lambda x: x['edge'], reverse=True)
     print_report(all_recs)
+
+    # Also write results.csv for later analysis
+    try:
+        if all_recs:
+            df = pd.DataFrame(all_recs)
+            # Order columns
+            cols = ['ticker', 'option_type', 'strike', 'expiration', 'opt_price', 'market_iv', 'pred_vol', 'edge']
+            df = df[cols]
+            df.to_csv(RESULTS_CSV, index=False)
+            print(f"Wrote {len(df)} rows to {RESULTS_CSV}")
+        else:
+            print("No candidates to write to CSV.")
+    except Exception as e:
+        print(f"Warning: failed to write {RESULTS_CSV}: {e}")
 
 
 if __name__ == '__main__':
