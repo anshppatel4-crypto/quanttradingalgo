@@ -4,9 +4,10 @@ Updated entry point: scan tickers from tickers.txt and evaluate all option contr
 Key features:
 - Uses ONLY tickers from tickers.txt (expects 104 tickers)
 - For EACH ticker, exports top 5 options by estimated return %
+- QQQ and SPY: top 10 options expiring TOMORROW ONLY
 - ONLY options with premium under $10 (opt_price < 10.0)
 - Exports ALL tickers to results.csv
-- Estimated return % = (pred_vol - market_iv) / market_iv * sqrt(days_to_expiry / 365) * 100
+- Accurate return % = (premium gained from vol expansion) / premium paid * 100
 - Sorted by return % descending within each ticker
 """
 
@@ -19,6 +20,7 @@ import time
 import pandas as pd
 import sys
 import re
+import numpy as np
 
 # Configuration
 EDGE_THRESHOLD = 0.04  # 4% in decimal
@@ -29,6 +31,7 @@ MIN_PRICE = 0.0001
 MIN_HISTORY_DAYS = 100
 RESULTS_CSV = "results.csv"
 TOP_N_PER_TICKER = 5  # Top 5 per ticker
+TOP_N_QQQ_SPY = 10  # Top 10 for QQQ and SPY
 
 
 def format_pct(x):
@@ -45,46 +48,67 @@ def format_price(x):
         return "-"
 
 
-def estimate_return_pct(pred_vol, market_iv, days_to_expiry, opt_price):
-    """Estimate percent return as % gain on premium paid.
+def black_scholes_vega(S, K, T, r, sigma):
+    """Calculate vega (sensitivity to 1% vol change) using Black-Scholes."""
+    try:
+        from scipy.stats import norm
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        vega = S * norm.pdf(d1) * np.sqrt(T) / 100  # per 1% vol change
+        return max(0, vega)
+    except Exception:
+        # Fallback: rough approximation
+        return 0.04 * S * np.sqrt(T)
+
+
+def calculate_accurate_return_pct(opt_price, strike, days_to_expiry, pred_vol, market_iv, stock_price=None):
+    """Calculate accurate option return % based on Black-Scholes vega.
     
-    Simple model: if vol edge exists, option premium should increase
-    Return % = (pred_vol - market_iv) / market_iv * sqrt(days_to_expiry / 365) * 100
-    Then scale by option price (cheaper options have higher %)
+    Model:
+    1. If predicted_vol > market_iv, option value increases
+    2. Use vega to estimate how much premium changes per vol point
+    3. Return % = (new_premium - old_premium) / old_premium * 100
     """
     try:
+        opt_price = float(opt_price)
+        strike = float(strike)
         pred_vol = float(pred_vol)
         market_iv = float(market_iv)
-        opt_price = float(opt_price)
         days = max(1, int(days_to_expiry))
         
-        if market_iv <= 0 or opt_price <= 0:
+        if opt_price <= 0 or market_iv <= 0:
             return 0.0
         
-        # Volatility edge relative to market IV (normalized)
-        vol_edge_pct = (pred_vol - market_iv) / market_iv
+        # Use strike as proxy for stock price if not provided
+        if stock_price is None:
+            stock_price = strike
         
-        # Scale by time to expiration
-        time_factor = (days / 365.0) ** 0.5
+        # Time to expiry in years
+        T = days / 365.0
+        r = 0.05  # Risk-free rate
         
-        # Base return estimate
-        base_return = vol_edge_pct * time_factor * 100
+        # Calculate vega (option value change per 1% vol change)
+        vega = black_scholes_vega(stock_price, strike, T, r, market_iv)
         
-        # Cheaper options have higher percentage returns (leverage effect)
-        # Rough estimate: if vol moves 1%, option moves ~vega amount
-        # For simplicity: assume vega ≈ 0.04 * strike, and delta ≈ 0.5
-        # Simple hack: cheaper options get multiplied boost
-        price_multiplier = max(1.0, 5.0 / opt_price)  # $1 option gets 5x boost
+        # Volume change (in percentage points, e.g., 0.20 for 20%)
+        vol_change = (pred_vol - market_iv) * 100  # Convert to basis points
         
-        est_ret = base_return * price_multiplier
-        return est_ret
-    except Exception:
+        # Estimated premium gain
+        premium_gain = vega * vol_change
+        
+        # Return % = (gain / initial premium) * 100
+        if premium_gain > 0:
+            return_pct = (premium_gain / opt_price) * 100
+            return max(0, return_pct)  # Cap at 0 if negative
+        else:
+            return 0.0
+            
+    except Exception as e:
         return 0.0
 
 
 def print_report(recs_by_ticker):
-    """Print top 5 per ticker, grouped by ticker."""
-    title = "🔥 TOP 5 OPTIONS PER TICKER (Premium < $10) — Estimated Return % 🔥"
+    """Print top N per ticker, grouped by ticker."""
+    title = "🔥 TOP OPTIONS PER TICKER (Premium < $10) — Accurate Return % 🔥"
     print("\n" + title)
     print("=" * len(title))
 
@@ -98,8 +122,8 @@ def print_report(recs_by_ticker):
             continue
 
         print(f"\n--- {ticker} (Top {len(recs)}) ---")
-        cols = ["Type", "Strike", "Expiration", "Premium", "Est Return %", "Market IV", "Predicted Vol", "Edge %"]
-        widths = [6, 10, 12, 10, 14, 12, 14, 10]
+        cols = ["Type", "Strike", "Expiration", "Premium", "Est Return %", "Market IV", "Predicted Vol", "Edge %", "Days"]
+        widths = [6, 10, 12, 10, 14, 12, 14, 10, 6]
 
         header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
         print(header)
@@ -109,7 +133,7 @@ def print_report(recs_by_ticker):
             line = (
                 f"{r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
                 f"{format_price(r['opt_price']):<10} | {r['est_return']:>13.2f}% | {format_pct(r['market_iv']):<12} | "
-                f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}%"
+                f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}% | {r['days_to_exp']:<6}"
             )
             print(line)
 
@@ -193,9 +217,16 @@ def option_mid_price(row):
     return None
 
 
-def scan_ticker(ticker):
+def scan_ticker(ticker, filter_tomorrow=False):
+    """Scan ticker for options.
+    
+    Args:
+        ticker: ticker symbol
+        filter_tomorrow: if True, only return options expiring tomorrow
+    """
     recs = []
     today = datetime.datetime.utcnow().date()
+    tomorrow = today + datetime.timedelta(days=1)
 
     try:
         prices = fetch_historical_prices(ticker)
@@ -247,23 +278,34 @@ def scan_ticker(ticker):
                     except Exception:
                         exp_str = str(exp)
 
+                # Parse expiration date
+                try:
+                    exp_date = pd.to_datetime(exp).date()
+                except Exception:
+                    continue
+
+                # If filtering for tomorrow, skip if not tomorrow
+                if filter_tomorrow and exp_date != tomorrow:
+                    continue
+
                 option_type = row.get('contractType') or row.get('type') or row.get('side') or row.get('option_type') or 'CALL'
 
                 # Calculate days to expiry
-                try:
-                    exp_date = pd.to_datetime(exp).date()
-                    days_to_exp = (exp_date - today).days
-                    days_to_exp = max(1, days_to_exp)
-                except Exception:
-                    days_to_exp = 30
+                days_to_exp = (exp_date - today).days
+                days_to_exp = max(1, days_to_exp)
 
-                # Calculate estimated return %
-                est_ret = estimate_return_pct(pred_vol, market_iv, days_to_exp, opt_price)
+                # Get strike price for vega calculation
+                strike = float(row['strike']) if 'strike' in row and row['strike'] == row['strike'] else 0.0
+
+                # Calculate ACCURATE return %
+                est_ret = calculate_accurate_return_pct(
+                    opt_price, strike, days_to_exp, pred_vol, market_iv
+                )
 
                 recs.append({
                     'ticker': ticker,
                     'option_type': 'Call' if str(option_type).lower().startswith('c') else 'Put',
-                    'strike': float(row['strike']) if 'strike' in row and row['strike'] == row['strike'] else 0.0,
+                    'strike': strike,
                     'expiration': exp_str,
                     'market_iv': float(market_iv),
                     'pred_vol': float(pred_vol),
@@ -290,9 +332,20 @@ def main():
     print(f"Filtering for options under ${OPTION_PRICE_CAP} premium...\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-        futures = {exe.submit(scan_ticker, t): t for t in watchlist}
+        futures = {}
+        
+        # Submit regular tickers
+        for t in watchlist:
+            if t not in ['QQQ', 'SPY']:
+                futures[exe.submit(scan_ticker, t, filter_tomorrow=False)] = (t, False)
+        
+        # Submit QQQ and SPY with tomorrow filter
+        for t in ['QQQ', 'SPY']:
+            if t in watchlist:
+                futures[exe.submit(scan_ticker, t, filter_tomorrow=True)] = (t, True)
+        
         for fut in concurrent.futures.as_completed(futures):
-            t = futures[fut]
+            t, is_tomorrow = futures[fut]
             try:
                 recs = fut.result()
                 if recs:
@@ -303,7 +356,7 @@ def main():
             # small sleep to be gentle on remote
             time.sleep(SLEEP_BETWEEN_TICKERS)
 
-    # Group by ticker and get top 5 per ticker by return %
+    # Group by ticker and get top N per ticker by return %
     recs_by_ticker = {}
     for rec in all_recs:
         ticker = rec['ticker']
@@ -311,17 +364,23 @@ def main():
             recs_by_ticker[ticker] = []
         recs_by_ticker[ticker].append(rec)
 
-    # Sort each ticker's options by est_return descending and keep top 5
+    # Sort each ticker's options by est_return descending
     for ticker in recs_by_ticker:
         recs_by_ticker[ticker] = sorted(
             recs_by_ticker[ticker],
             key=lambda x: x['est_return'],
             reverse=True
-        )[:TOP_N_PER_TICKER]
+        )
+        
+        # Keep top 10 for QQQ/SPY, top 5 for others
+        if ticker in ['QQQ', 'SPY']:
+            recs_by_ticker[ticker] = recs_by_ticker[ticker][:TOP_N_QQQ_SPY]
+        else:
+            recs_by_ticker[ticker] = recs_by_ticker[ticker][:TOP_N_PER_TICKER]
 
     print_report(recs_by_ticker)
 
-    # Write ALL top 5 results (from all tickers) to CSV
+    # Write ALL top results to CSV
     try:
         all_top_recs = []
         for ticker in sorted(recs_by_ticker.keys()):
