@@ -1,11 +1,12 @@
 """main.py
-Updated entry point: scan tickers from tickers.txt and evaluate all option contracts priced under $1000.
+Updated entry point: scan tickers from tickers.txt and evaluate all option contracts priced under $10.
 
 Key features:
 - Uses ONLY tickers from tickers.txt (expects 104 tickers)
 - For EACH ticker, exports top 5 options by estimated return %
+- ONLY options with premium under $10 (opt_price < 10.0)
 - Exports ALL tickers to results.csv
-- Estimated return % = (pred_vol - market_iv) * sqrt(days_to_expiry/365) * 100
+- Estimated return % = (pred_vol - market_iv) * sqrt(days_to_expiry / 365)
 - Sorted by return % descending within each ticker
 """
 
@@ -23,7 +24,7 @@ import re
 EDGE_THRESHOLD = 0.04  # 4% in decimal
 MAX_WORKERS = 6        # concurrency when scanning tickers (keep small to avoid rate limits)
 SLEEP_BETWEEN_TICKERS = 0.2  # seconds
-OPTION_PRICE_CAP = 1000.0  # only consider options priced below this
+OPTION_PRICE_CAP = 10.0  # only consider options priced below this ($10 premium)
 MIN_PRICE = 0.0001
 MIN_HISTORY_DAYS = 100
 RESULTS_CSV = "results.csv"
@@ -69,7 +70,7 @@ def estimate_return_pct(pred_vol, market_iv, days_to_expiry):
 
 def print_report(recs_by_ticker):
     """Print top 5 per ticker, grouped by ticker."""
-    title = "🔥 TOP 5 OPTIONS PER TICKER — Estimated Return % 🔥"
+    title = "🔥 TOP 5 OPTIONS PER TICKER (Premium < $10) — Estimated Return % 🔥"
     print("\n" + title)
     print("=" * len(title))
 
@@ -83,8 +84,8 @@ def print_report(recs_by_ticker):
             continue
 
         print(f"\n--- {ticker} (Top {len(recs)}) ---")
-        cols = ["Type", "Strike", "Expiration", "Opt Price", "Est Return %", "Market IV", "Predicted Vol", "Edge %"]
-        widths = [6, 10, 12, 12, 14, 12, 14, 10]
+        cols = ["Type", "Strike", "Expiration", "Premium", "Est Return %", "Market IV", "Predicted Vol", "Edge %"]
+        widths = [6, 10, 12, 10, 14, 12, 14, 10]
 
         header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
         print(header)
@@ -93,7 +94,7 @@ def print_report(recs_by_ticker):
         for r in recs:
             line = (
                 f"{r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
-                f"{format_price(r['opt_price']):<12} | {r['est_return']:<14.2f} | {format_pct(r['market_iv']):<12} | "
+                f"{format_price(r['opt_price']):<10} | {r['est_return']:<14.2f} | {format_pct(r['market_iv']):<12} | "
                 f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}%"
             )
             print(line)
@@ -211,6 +212,7 @@ def scan_ticker(ticker):
             opt_price = option_mid_price(row)
             if opt_price is None:
                 continue
+            # FILTER: Only options under $10 premium
             if not (opt_price >= MIN_PRICE and opt_price < OPTION_PRICE_CAP):
                 continue
 
@@ -271,6 +273,7 @@ def main():
 
     all_recs = []
     print(f"Starting scan of {len(watchlist)} tickers (concurrency={MAX_WORKERS})...")
+    print(f"Filtering for options under ${OPTION_PRICE_CAP} premium...\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
         futures = {exe.submit(scan_ticker, t): t for t in watchlist}
