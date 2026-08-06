@@ -5,9 +5,11 @@ Key features:
 - Uses ONLY tickers from tickers.txt (expects 104 tickers)
 - For EACH ticker, exports top 5 options by estimated return %
 - QQQ and SPY: top 10 options expiring TOMORROW ONLY
+- All other tickers: options expiring within 30 days
 - ONLY options with premium under $10 (opt_price < 10.0)
 - HIGHLY ACCURATE model: Delta, Gamma, Theta, Vega, Rho (interest rates)
 - Dividend adjustments for dividend-paying stocks
+- 30-day hold P&L calculation
 - Exports ALL tickers to results.csv
 - Sorted by return % descending within each ticker
 """
@@ -33,6 +35,7 @@ MIN_HISTORY_DAYS = 100
 RESULTS_CSV = "results.csv"
 TOP_N_PER_TICKER = 5  # Top 5 per ticker
 TOP_N_QQQ_SPY = 10  # Top 10 for QQQ and SPY
+MAX_DAYS_TO_HOLD = 30  # Hold options for max 30 days
 RISK_FREE_RATE = 0.05  # 5% annual rate
 DIVIDEND_YIELDS = {  # Annual dividend yield by ticker
     'SPY': 0.018,  # ~1.8% yield
@@ -114,11 +117,11 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type='call', q=0):
         return {'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0, 'rho': 0}
 
 
-def calculate_pnl_tomorrow(opt_price, strike, stock_price, T, pred_vol, market_iv, 
-                           option_type='call', ticker='', rate=RISK_FREE_RATE):
-    """Calculate realistic P&L over 1 day including all Greeks.
+def calculate_pnl_30day(opt_price, strike, stock_price, T, pred_vol, market_iv, 
+                        option_type='call', ticker='', rate=RISK_FREE_RATE, days_to_expiry=30):
+    """Calculate realistic P&L over 30 days (or until expiration, whichever is sooner).
     
-    Scenario: Hold option for 1 day, assuming predicted vol is realized
+    Scenario: Hold option for 30 days (or to expiration), assuming predicted vol is realized
     """
     try:
         opt_price = float(opt_price)
@@ -127,6 +130,7 @@ def calculate_pnl_tomorrow(opt_price, strike, stock_price, T, pred_vol, market_i
         T = float(T)
         pred_vol = float(pred_vol)
         market_iv = float(market_iv)
+        days_to_expiry = int(days_to_expiry)
         
         if opt_price <= 0 or market_iv <= 0 or T <= 0:
             return 0.0
@@ -134,28 +138,32 @@ def calculate_pnl_tomorrow(opt_price, strike, stock_price, T, pred_vol, market_i
         # Get dividend yield for this ticker
         q = DIVIDEND_YIELDS.get(ticker, 0.0)
         
+        # Hold for min(30, days_to_expiry) days
+        hold_days = min(MAX_DAYS_TO_HOLD, days_to_expiry)
+        
         # Current Greeks at market IV
         greeks_now = black_scholes_greeks(stock_price, strike, T, rate, market_iv, option_type, q)
         
-        # Tomorrow's Greeks (1 day less, at predicted vol)
-        T_tomorrow = max(0.001, T - 1/365.0)
-        greeks_tmrw = black_scholes_greeks(stock_price, strike, T_tomorrow, rate, pred_vol, option_type, q)
+        # Future Greeks after hold period (at predicted vol)
+        T_future = max(0.001, T - hold_days/365.0)
+        greeks_future = black_scholes_greeks(stock_price, strike, T_future, rate, pred_vol, option_type, q)
         
-        # P&L components over 1 day:
-        # 1. Theta decay (negative, loses value)
-        pnl_theta = greeks_now['theta']  # Already in per-day units
+        # P&L components over hold period:
+        # 1. Theta decay (negative, loses value daily)
+        # Average theta over hold period (theta decays faster as expiration approaches)
+        pnl_theta = greeks_now['theta'] * hold_days
         
         # 2. Vega profit (vol expansion from market_iv to pred_vol, in percentage points)
         vol_change = (pred_vol - market_iv) * 100  # Convert to basis points
         pnl_vega = greeks_now['vega'] * vol_change
         
         # 3. Gamma (convexity): small stock moves create gamma profit
-        # Assume 0.5% stock move as base case
-        stock_move_pct = 0.005
+        # Assume 0.5% stock move per day * sqrt(days) for total move
+        stock_move_pct = 0.005 * np.sqrt(hold_days)
         stock_move = stock_price * stock_move_pct
         pnl_gamma = 0.5 * greeks_now['gamma'] * (stock_move ** 2)
         
-        # 4. Interest rate impact (usually small for short-dated)
+        # 4. Interest rate impact (usually small)
         # Assume 25 bps rate change
         rate_change = 0.0025
         pnl_rho = greeks_now['rho'] * rate_change
@@ -176,7 +184,7 @@ def calculate_pnl_tomorrow(opt_price, strike, stock_price, T, pred_vol, market_i
 
 def print_report(recs_by_ticker):
     """Print top N per ticker, grouped by ticker."""
-    title = "🔥 TOP OPTIONS PER TICKER (Premium < $10) — Accurate 1-Day P&L 🔥"
+    title = f"🔥 TOP OPTIONS PER TICKER (Premium < $10) — 30-Day Hold P&L 🔥"
     print("\n" + title)
     print("=" * len(title))
 
@@ -190,8 +198,8 @@ def print_report(recs_by_ticker):
             continue
 
         print(f"\n--- {ticker} (Top {len(recs)}) ---")
-        cols = ["Type", "Strike", "Expiration", "Premium", "Est 1-Day Return %", "Market IV", "Predicted Vol", "Edge %", "Days"]
-        widths = [6, 10, 12, 10, 18, 12, 14, 10, 6]
+        cols = ["Type", "Strike", "Expiration", "Premium", "Est 30-Day Return %", "Market IV", "Predicted Vol", "Edge %", "Days"]
+        widths = [6, 10, 12, 10, 20, 12, 14, 10, 6]
 
         header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
         print(header)
@@ -200,7 +208,7 @@ def print_report(recs_by_ticker):
         for r in recs:
             line = (
                 f"{r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
-                f"{format_price(r['opt_price']):<10} | {r['est_return']:>17.2f}% | {format_pct(r['market_iv']):<12} | "
+                f"{format_price(r['opt_price']):<10} | {r['est_return']:>19.2f}% | {format_pct(r['market_iv']):<12} | "
                 f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}% | {r['days_to_exp']:<6}"
             )
             print(line)
@@ -295,6 +303,7 @@ def scan_ticker(ticker, filter_tomorrow=False):
     recs = []
     today = datetime.datetime.utcnow().date()
     tomorrow = today + datetime.timedelta(days=1)
+    max_expiry = today + datetime.timedelta(days=MAX_DAYS_TO_HOLD)
 
     try:
         prices = fetch_historical_prices(ticker)
@@ -358,9 +367,15 @@ def scan_ticker(ticker, filter_tomorrow=False):
                 except Exception:
                     continue
 
-                # If filtering for tomorrow, skip if not tomorrow
-                if filter_tomorrow and exp_date != tomorrow:
-                    continue
+                # Filter by expiration
+                if filter_tomorrow:
+                    # QQQ/SPY: tomorrow only
+                    if exp_date != tomorrow:
+                        continue
+                else:
+                    # All others: within 30 days
+                    if exp_date > max_expiry:
+                        continue
 
                 option_type = row.get('contractType') or row.get('type') or row.get('side') or row.get('option_type') or 'CALL'
 
@@ -372,12 +387,13 @@ def scan_ticker(ticker, filter_tomorrow=False):
                 # Get strike price
                 strike = float(row['strike']) if 'strike' in row and row['strike'] == row['strike'] else 0.0
 
-                # Calculate ACCURATE 1-day return % using full Greeks model
-                est_ret = calculate_pnl_tomorrow(
+                # Calculate ACCURATE 30-day return % using full Greeks model
+                est_ret = calculate_pnl_30day(
                     opt_price, strike, stock_price, T, pred_vol, market_iv,
                     option_type='call' if str(option_type).lower().startswith('c') else 'put',
                     ticker=ticker,
-                    rate=RISK_FREE_RATE
+                    rate=RISK_FREE_RATE,
+                    days_to_expiry=days_to_exp
                 )
 
                 recs.append({
@@ -408,6 +424,8 @@ def main():
     all_recs = []
     print(f"Starting scan of {len(watchlist)} tickers (concurrency={MAX_WORKERS})...")
     print(f"Filtering for options under ${OPTION_PRICE_CAP} premium...")
+    print(f"QQQ/SPY: tomorrow expiration only")
+    print(f"Other tickers: expiring within {MAX_DAYS_TO_HOLD} days")
     print(f"Using full Greeks model: Delta, Gamma, Vega, Theta, Rho\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
