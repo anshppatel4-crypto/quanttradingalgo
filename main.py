@@ -5,8 +5,9 @@ Improvements in this update:
 - Robust tickers.txt parsing & normalization to handle literal "\\n" / "\\N" escapes, commas, semicolons,
   and some concatenated uppercase sequences (e.g. AAPLMSFTAMZN will be split into AAPL, MSFT, AMZN when possible).
 - Validation of ticker tokens (keeps A-Z, 0-9, dot, dash) and normalizes '.' -> '-' for Yahoo format.
-- Writes results.csv with candidate rows (columns: ticker, option_type, strike, expiration, opt_price, market_iv, pred_vol, edge).
+- Writes results.csv with candidate rows (columns: ticker, option_type, strike, expiration, opt_price, market_iv, pred_vol, edge, est_return).
 - Keeps previous behavior (S&P fetch fallback, concurrency, option price cap, GARCH engine).
+- UPDATED: Top 5 per option type, added QQQ/SPY/ODT, added estimated percent return.
 """
 
 from scanner_engine.data_fetcher import fetch_historical_prices, fetch_options_chain
@@ -27,6 +28,7 @@ OPTION_PRICE_CAP = 1000.0  # only consider options priced below this
 MIN_PRICE = 0.0001
 MIN_HISTORY_DAYS = 100
 RESULTS_CSV = "results.csv"
+TOP_N_PER_TYPE = 5  # Top 5 per option type
 
 
 def format_pct(x):
@@ -43,37 +45,67 @@ def format_price(x):
         return "-"
 
 
-def print_report(recs):
-    title = "🔥 OPTIONS RECOMMENDATIONS (S&P 500) — Contracts priced under $1000 🔥"
+def estimate_return(opt_price, pred_vol, days_to_expiry):
+    """Estimate percent return assuming volatility mean-reversion.
+    
+    Simple model: if predicted vol > market IV, option will gain value.
+    Rough estimate: return ≈ (pred_vol - market_iv) * sqrt(days_to_expiry / 365)
+    """
+    try:
+        opt_price = float(opt_price)
+        pred_vol = float(pred_vol)
+        if opt_price <= 0:
+            return 0.0
+        # Days to expiry as fraction of year
+        t = max(1, days_to_expiry) / 365.0
+        # Volatility edge annualized and discounted to time frame
+        vol_edge = pred_vol * (t ** 0.5)
+        # Rough option value change per 1% vol change ≈ vega (simplified)
+        # Assume option delta ≈ 0.5 for ATM, use rough vega
+        est_return = vol_edge * opt_price * 0.5  # very rough estimate
+        return est_return / opt_price if opt_price > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def print_report(recs_by_type):
+    """Print top 5 calls and top 5 puts separately."""
+    title = "🔥 TOP OPTIONS RECOMMENDATIONS (QQQ, SPY, ODT + S&P 500) — Under $1000 🔥"
     print("\n" + title)
     print("=" * len(title))
 
-    if not recs:
+    if not recs_by_type or all(not v for v in recs_by_type.values()):
         print("No recommendations found that meet the edge threshold and price cap.")
         return
 
-    cols = ["Ticker", "Type", "Strike", "Expiration", "Opt Price", "Market IV", "Predicted Vol", "Edge %"]
-    widths = [8, 6, 10, 12, 12, 12, 14, 10]
+    for option_type in ['Call', 'Put']:
+        recs = recs_by_type.get(option_type, [])
+        if not recs:
+            continue
 
-    header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
-    print(header)
-    print("-" * len(header))
+        print(f"\n--- TOP {len(recs)} {option_type.upper()}S ---")
+        cols = ["Ticker", "Type", "Strike", "Expiration", "Opt Price", "Market IV", "Predicted Vol", "Edge %", "Est Return %"]
+        widths = [8, 6, 10, 12, 12, 12, 14, 10, 12]
 
-    for r in recs:
-        line = (
-            f"{r['ticker']:<8} | {r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
-            f"{format_price(r['opt_price']):<12} | {format_pct(r['market_iv']):<12} | {format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}%"
-        )
-        print(line)
+        header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
+        print(header)
+        print("-" * len(header))
+
+        for r in recs:
+            line = (
+                f"{r['ticker']:<8} | {r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
+                f"{format_price(r['opt_price']):<12} | {format_pct(r['market_iv']):<12} | {format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}% | {r['est_return']*100:8.2f}%"
+            )
+            print(line)
 
 
 def load_watchlist(path="tickers.txt"):
-    """Load tickers from file if present, otherwise fetch S&P 500 list from Wikipedia.
-
-    This function is defensive: it will normalize common mistakes such as literal
-    "\\n" characters, use commas/semicolons as separators, and attempt to split
-    concatenated uppercase sequences into plausible tickers.
+    """Load tickers from file if present, otherwise use default watchlist + S&P 500.
+    
+    Always includes: QQQ, SPY, ODT
     """
+    default_tickers = ['QQQ', 'SPY', 'ODT']
+    
     # If user provided tickers.txt, try to parse & normalize it
     try:
         raw = open(path, 'r', encoding='utf8').read()
@@ -108,25 +140,34 @@ def load_watchlist(path="tickers.txt"):
                     normalized.append(s2)
 
             if normalized:
-                print(f"Loaded {len(normalized)} tickers from {path} (normalized).")
+                # Add defaults if not already present
+                for t in default_tickers:
+                    if t not in normalized:
+                        normalized.insert(0, t)
+                print(f"Loaded {len(normalized)} tickers from {path} (normalized), including defaults.")
                 return normalized
     except FileNotFoundError:
         pass
     except Exception as e:
         print(f"Warning: failed to parse {path}: {e}")
 
-    # Fallback: fetch S&P 500 symbols from Wikipedia
+    # Fallback: fetch S&P 500 symbols from Wikipedia + defaults
     print("Fetching S&P 500 tickers from Wikipedia...")
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = tables[0]
         symbols = df['Symbol'].tolist()
         symbols = [s.replace('.', '-').upper() for s in symbols]
-        print(f"Loaded {len(symbols)} S&P 500 tickers.")
+        # Add defaults at beginning
+        for t in reversed(default_tickers):
+            if t not in symbols:
+                symbols.insert(0, t)
+        print(f"Loaded {len(symbols)} tickers ({len(default_tickers)} defaults + S&P 500).")
         return symbols
     except Exception as e:
         print(f"Failed to fetch S&P 500 list: {e}")
-        return []
+        print(f"Using defaults only: {default_tickers}")
+        return default_tickers
 
 
 def option_mid_price(row):
@@ -215,6 +256,17 @@ def scan_ticker(ticker):
 
                 option_type = row.get('contractType') or row.get('type') or row.get('side') or row.get('option_type') or 'CALL'
 
+                # Calculate days to expiry
+                try:
+                    exp_date = pd.to_datetime(exp).date()
+                    days_to_exp = (exp_date - today).days
+                    days_to_exp = max(1, days_to_exp)
+                except Exception:
+                    days_to_exp = 30
+
+                # Calculate estimated return
+                est_ret = estimate_return(opt_price, pred_vol, days_to_exp)
+
                 recs.append({
                     'ticker': ticker,
                     'option_type': 'Call' if str(option_type).lower().startswith('c') else 'Put',
@@ -224,6 +276,8 @@ def scan_ticker(ticker):
                     'pred_vol': float(pred_vol),
                     'edge': float(edge),
                     'opt_price': float(opt_price),
+                    'est_return': est_ret,
+                    'days_to_exp': days_to_exp,
                 })
 
     except Exception as e:
@@ -257,19 +311,26 @@ def main():
 
     # Sort by edge desc
     all_recs = sorted(all_recs, key=lambda x: x['edge'], reverse=True)
-    print_report(all_recs)
+
+    # Split into calls and puts, keep top 5 each
+    calls = [r for r in all_recs if r['option_type'] == 'Call'][:TOP_N_PER_TYPE]
+    puts = [r for r in all_recs if r['option_type'] == 'Put'][:TOP_N_PER_TYPE]
+
+    recs_by_type = {'Call': calls, 'Put': puts}
+    print_report(recs_by_type)
 
     # Also write results.csv for later analysis
     try:
-        if all_recs:
-            df = pd.DataFrame(all_recs)
+        top_recs = calls + puts
+        if top_recs:
+            df = pd.DataFrame(top_recs)
             # Order columns
-            cols = ['ticker', 'option_type', 'strike', 'expiration', 'opt_price', 'market_iv', 'pred_vol', 'edge']
+            cols = ['ticker', 'option_type', 'strike', 'expiration', 'opt_price', 'market_iv', 'pred_vol', 'edge', 'est_return', 'days_to_exp']
             df = df[cols]
             df.to_csv(RESULTS_CSV, index=False)
-            print(f"Wrote {len(df)} rows to {RESULTS_CSV}")
+            print(f"\nWrote {len(df)} rows to {RESULTS_CSV}")
         else:
-            print("No candidates to write to CSV.")
+            print("\nNo candidates to write to CSV.")
     except Exception as e:
         print(f"Warning: failed to write {RESULTS_CSV}: {e}")
 
