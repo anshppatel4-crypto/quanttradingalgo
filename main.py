@@ -1,13 +1,12 @@
 """main.py
-Updated entry point: scan the S&P 500 (or tickers.txt) and evaluate all option contracts priced under $1000.
+Updated entry point: scan tickers from tickers.txt and evaluate all option contracts priced under $1000.
 
-Improvements in this update:
-- Robust tickers.txt parsing & normalization to handle literal "\\n" / "\\N" escapes, commas, semicolons,
-  and some concatenated uppercase sequences (e.g. AAPLMSFTAMZN will be split into AAPL, MSFT, AMZN when possible).
-- Validation of ticker tokens (keeps A-Z, 0-9, dot, dash) and normalizes '.' -> '-' for Yahoo format.
-- Writes results.csv with candidate rows (columns: ticker, option_type, strike, expiration, opt_price, market_iv, pred_vol, edge, est_return).
-- Keeps previous behavior (S&P fetch fallback, concurrency, option price cap, GARCH engine).
-- UPDATED: Top 5 per option type, added QQQ/SPY/ODT, added estimated percent return.
+Key features:
+- Uses ONLY tickers from tickers.txt (expects 104 tickers)
+- For EACH ticker, exports top 5 options by estimated return %
+- Exports ALL tickers to results.csv
+- Estimated return % = (pred_vol - market_iv) * sqrt(days_to_expiry/365) * 100
+- Sorted by return % descending within each ticker
 """
 
 from scanner_engine.data_fetcher import fetch_historical_prices, fetch_options_chain
@@ -28,7 +27,7 @@ OPTION_PRICE_CAP = 1000.0  # only consider options priced below this
 MIN_PRICE = 0.0001
 MIN_HISTORY_DAYS = 100
 RESULTS_CSV = "results.csv"
-TOP_N_PER_TYPE = 5  # Top 5 per option type
+TOP_N_PER_TICKER = 5  # Top 5 per ticker
 
 
 def format_pct(x):
@@ -45,47 +44,47 @@ def format_price(x):
         return "-"
 
 
-def estimate_return(opt_price, pred_vol, days_to_expiry):
-    """Estimate percent return assuming volatility mean-reversion.
+def estimate_return_pct(pred_vol, market_iv, days_to_expiry):
+    """Estimate percent return as volatility edge scaled by time.
     
-    Simple model: if predicted vol > market IV, option will gain value.
-    Rough estimate: return ≈ (pred_vol - market_iv) * sqrt(days_to_expiry / 365)
+    Return % = (pred_vol - market_iv) * sqrt(days_to_expiry / 365) * 100
     """
     try:
-        opt_price = float(opt_price)
         pred_vol = float(pred_vol)
-        if opt_price <= 0:
-            return 0.0
-        # Days to expiry as fraction of year
-        t = max(1, days_to_expiry) / 365.0
-        # Volatility edge annualized and discounted to time frame
-        vol_edge = pred_vol * (t ** 0.5)
-        # Rough option value change per 1% vol change ≈ vega (simplified)
-        # Assume option delta ≈ 0.5 for ATM, use rough vega
-        est_return = vol_edge * opt_price * 0.5  # very rough estimate
-        return est_return / opt_price if opt_price > 0 else 0.0
+        market_iv = float(market_iv)
+        days = max(1, int(days_to_expiry))
+        
+        # Volatility edge (in decimal, e.g. 0.15 for 15%)
+        vol_edge = pred_vol - market_iv
+        
+        # Scale by time to expiration
+        time_factor = (days / 365.0) ** 0.5
+        
+        # Estimated return as percentage
+        est_ret = vol_edge * time_factor * 100
+        return est_ret
     except Exception:
         return 0.0
 
 
-def print_report(recs_by_type):
-    """Print top 5 calls and top 5 puts separately."""
-    title = "🔥 TOP OPTIONS RECOMMENDATIONS (QQQ, SPY, ODT + S&P 500) — Under $1000 🔥"
+def print_report(recs_by_ticker):
+    """Print top 5 per ticker, grouped by ticker."""
+    title = "🔥 TOP 5 OPTIONS PER TICKER — Estimated Return % 🔥"
     print("\n" + title)
     print("=" * len(title))
 
-    if not recs_by_type or all(not v for v in recs_by_type.values()):
+    if not recs_by_ticker:
         print("No recommendations found that meet the edge threshold and price cap.")
         return
 
-    for option_type in ['Call', 'Put']:
-        recs = recs_by_type.get(option_type, [])
+    for ticker in sorted(recs_by_ticker.keys()):
+        recs = recs_by_ticker[ticker]
         if not recs:
             continue
 
-        print(f"\n--- TOP {len(recs)} {option_type.upper()}S ---")
-        cols = ["Ticker", "Type", "Strike", "Expiration", "Opt Price", "Market IV", "Predicted Vol", "Edge %", "Est Return %"]
-        widths = [8, 6, 10, 12, 12, 12, 14, 10, 12]
+        print(f"\n--- {ticker} (Top {len(recs)}) ---")
+        cols = ["Type", "Strike", "Expiration", "Opt Price", "Est Return %", "Market IV", "Predicted Vol", "Edge %"]
+        widths = [6, 10, 12, 12, 14, 12, 14, 10]
 
         header = " | ".join(c.ljust(w) for c, w in zip(cols, widths))
         print(header)
@@ -93,20 +92,15 @@ def print_report(recs_by_type):
 
         for r in recs:
             line = (
-                f"{r['ticker']:<8} | {r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
-                f"{format_price(r['opt_price']):<12} | {format_pct(r['market_iv']):<12} | {format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}% | {r['est_return']*100:8.2f}%"
+                f"{r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
+                f"{format_price(r['opt_price']):<12} | {r['est_return']:<14.2f} | {format_pct(r['market_iv']):<12} | "
+                f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}%"
             )
             print(line)
 
 
 def load_watchlist(path="tickers.txt"):
-    """Load tickers from file if present, otherwise use default watchlist + S&P 500.
-    
-    Always includes: QQQ, SPY, ODT
-    """
-    default_tickers = ['QQQ', 'SPY', 'ODT']
-    
-    # If user provided tickers.txt, try to parse & normalize it
+    """Load tickers from tickers.txt. File must exist."""
     try:
         raw = open(path, 'r', encoding='utf8').read()
         if raw and raw.strip():
@@ -140,34 +134,17 @@ def load_watchlist(path="tickers.txt"):
                     normalized.append(s2)
 
             if normalized:
-                # Add defaults if not already present
-                for t in default_tickers:
-                    if t not in normalized:
-                        normalized.insert(0, t)
-                print(f"Loaded {len(normalized)} tickers from {path} (normalized), including defaults.")
+                print(f"Loaded {len(normalized)} tickers from {path}.")
                 return normalized
     except FileNotFoundError:
-        pass
+        print(f"ERROR: {path} not found. Please create it with your tickers.")
+        sys.exit(1)
     except Exception as e:
-        print(f"Warning: failed to parse {path}: {e}")
+        print(f"ERROR: failed to parse {path}: {e}")
+        sys.exit(1)
 
-    # Fallback: fetch S&P 500 symbols from Wikipedia + defaults
-    print("Fetching S&P 500 tickers from Wikipedia...")
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = tables[0]
-        symbols = df['Symbol'].tolist()
-        symbols = [s.replace('.', '-').upper() for s in symbols]
-        # Add defaults at beginning
-        for t in reversed(default_tickers):
-            if t not in symbols:
-                symbols.insert(0, t)
-        print(f"Loaded {len(symbols)} tickers ({len(default_tickers)} defaults + S&P 500).")
-        return symbols
-    except Exception as e:
-        print(f"Failed to fetch S&P 500 list: {e}")
-        print(f"Using defaults only: {default_tickers}")
-        return default_tickers
+    print(f"ERROR: No tickers found in {path}")
+    sys.exit(1)
 
 
 def option_mid_price(row):
@@ -264,8 +241,8 @@ def scan_ticker(ticker):
                 except Exception:
                     days_to_exp = 30
 
-                # Calculate estimated return
-                est_ret = estimate_return(opt_price, pred_vol, days_to_exp)
+                # Calculate estimated return %
+                est_ret = estimate_return_pct(pred_vol, market_iv, days_to_exp)
 
                 recs.append({
                     'ticker': ticker,
@@ -309,24 +286,37 @@ def main():
             # small sleep to be gentle on remote
             time.sleep(SLEEP_BETWEEN_TICKERS)
 
-    # Sort by edge desc
-    all_recs = sorted(all_recs, key=lambda x: x['edge'], reverse=True)
+    # Group by ticker and get top 5 per ticker by return %
+    recs_by_ticker = {}
+    for rec in all_recs:
+        ticker = rec['ticker']
+        if ticker not in recs_by_ticker:
+            recs_by_ticker[ticker] = []
+        recs_by_ticker[ticker].append(rec)
 
-    # Split into calls and puts, keep top 5 each
-    calls = [r for r in all_recs if r['option_type'] == 'Call'][:TOP_N_PER_TYPE]
-    puts = [r for r in all_recs if r['option_type'] == 'Put'][:TOP_N_PER_TYPE]
+    # Sort each ticker's options by est_return descending and keep top 5
+    for ticker in recs_by_ticker:
+        recs_by_ticker[ticker] = sorted(
+            recs_by_ticker[ticker],
+            key=lambda x: x['est_return'],
+            reverse=True
+        )[:TOP_N_PER_TICKER]
 
-    recs_by_type = {'Call': calls, 'Put': puts}
-    print_report(recs_by_type)
+    print_report(recs_by_ticker)
 
-    # Also write results.csv for later analysis
+    # Write ALL top 5 results (from all tickers) to CSV
     try:
-        top_recs = calls + puts
-        if top_recs:
-            df = pd.DataFrame(top_recs)
+        all_top_recs = []
+        for ticker in sorted(recs_by_ticker.keys()):
+            all_top_recs.extend(recs_by_ticker[ticker])
+
+        if all_top_recs:
+            df = pd.DataFrame(all_top_recs)
             # Order columns
             cols = ['ticker', 'option_type', 'strike', 'expiration', 'opt_price', 'market_iv', 'pred_vol', 'edge', 'est_return', 'days_to_exp']
             df = df[cols]
+            # Sort by ticker, then by est_return desc
+            df = df.sort_values(['ticker', 'est_return'], ascending=[True, False])
             df.to_csv(RESULTS_CSV, index=False)
             print(f"\nWrote {len(df)} rows to {RESULTS_CSV}")
         else:
