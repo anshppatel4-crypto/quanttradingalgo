@@ -6,7 +6,7 @@ Key features:
 - For EACH ticker, exports top 5 options by estimated return %
 - ONLY options with premium under $10 (opt_price < 10.0)
 - Exports ALL tickers to results.csv
-- Estimated return % = (pred_vol - market_iv) * sqrt(days_to_expiry / 365)
+- Estimated return % = (pred_vol - market_iv) / market_iv * sqrt(days_to_expiry / 365) * 100
 - Sorted by return % descending within each ticker
 """
 
@@ -45,24 +45,38 @@ def format_price(x):
         return "-"
 
 
-def estimate_return_pct(pred_vol, market_iv, days_to_expiry):
-    """Estimate percent return as volatility edge scaled by time.
+def estimate_return_pct(pred_vol, market_iv, days_to_expiry, opt_price):
+    """Estimate percent return as % gain on premium paid.
     
-    Return % = (pred_vol - market_iv) * sqrt(days_to_expiry / 365) * 100
+    Simple model: if vol edge exists, option premium should increase
+    Return % = (pred_vol - market_iv) / market_iv * sqrt(days_to_expiry / 365) * 100
+    Then scale by option price (cheaper options have higher %)
     """
     try:
         pred_vol = float(pred_vol)
         market_iv = float(market_iv)
+        opt_price = float(opt_price)
         days = max(1, int(days_to_expiry))
         
-        # Volatility edge (in decimal, e.g. 0.15 for 15%)
-        vol_edge = pred_vol - market_iv
+        if market_iv <= 0 or opt_price <= 0:
+            return 0.0
+        
+        # Volatility edge relative to market IV (normalized)
+        vol_edge_pct = (pred_vol - market_iv) / market_iv
         
         # Scale by time to expiration
         time_factor = (days / 365.0) ** 0.5
         
-        # Estimated return as percentage
-        est_ret = vol_edge * time_factor * 100
+        # Base return estimate
+        base_return = vol_edge_pct * time_factor * 100
+        
+        # Cheaper options have higher percentage returns (leverage effect)
+        # Rough estimate: if vol moves 1%, option moves ~vega amount
+        # For simplicity: assume vega ≈ 0.04 * strike, and delta ≈ 0.5
+        # Simple hack: cheaper options get multiplied boost
+        price_multiplier = max(1.0, 5.0 / opt_price)  # $1 option gets 5x boost
+        
+        est_ret = base_return * price_multiplier
         return est_ret
     except Exception:
         return 0.0
@@ -94,7 +108,7 @@ def print_report(recs_by_ticker):
         for r in recs:
             line = (
                 f"{r['option_type']:<6} | {r['strike']:<10.2f} | {r['expiration']:<12} | "
-                f"{format_price(r['opt_price']):<10} | {r['est_return']:<14.2f} | {format_pct(r['market_iv']):<12} | "
+                f"{format_price(r['opt_price']):<10} | {r['est_return']:>13.2f}% | {format_pct(r['market_iv']):<12} | "
                 f"{format_pct(r['pred_vol']):<14} | {r['edge']*100:6.2f}%"
             )
             print(line)
@@ -244,7 +258,7 @@ def scan_ticker(ticker):
                     days_to_exp = 30
 
                 # Calculate estimated return %
-                est_ret = estimate_return_pct(pred_vol, market_iv, days_to_exp)
+                est_ret = estimate_return_pct(pred_vol, market_iv, days_to_exp, opt_price)
 
                 recs.append({
                     'ticker': ticker,
